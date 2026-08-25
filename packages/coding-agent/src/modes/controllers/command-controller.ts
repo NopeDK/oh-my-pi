@@ -259,7 +259,7 @@ export class CommandController {
 			loader.dispose();
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.setFocus(this.ctx.focusTarget);
 		};
 		loader.onAbort = () => {
 			restoreEditor();
@@ -1033,6 +1033,7 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
+		this.ctx.closeTerminalForSessionSwitch();
 		if (!(await this.ctx.session.newSession(options))) return;
 		// A focused subagent view keeps its own history: return to the main session
 		// first so the transcript below cannot rebuild from the subagent's surviving
@@ -1040,6 +1041,7 @@ export class CommandController {
 		// in-flight dispatches) the session boundary orphaned.
 		if (this.ctx.focusedAgentId) await this.ctx.unfocusSession();
 		this.ctx.eventController.resetTranscriptAnchors();
+		this.ctx.openTerminalForNewSession();
 		this.ctx.resetObserverRegistry();
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 

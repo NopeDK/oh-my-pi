@@ -786,7 +786,7 @@ export class MCPCommandController {
 		const done = () => {
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+		this.ctx.ui.setFocus(this.ctx.focusTarget);
 		};
 
 		// Create wizard with OAuth handler and connection test

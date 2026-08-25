@@ -129,6 +129,10 @@ export interface InteractiveModeContext {
 	deferredCommandContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
+	/** Component that should receive TUI focus after dialogs/overlays close.
+	 *  Normally the PaneLayout (which delegates to the editor internally), but
+	 *  falls back to the editor when no pane layout is active. */
+	readonly focusTarget: Component;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
@@ -152,6 +156,10 @@ export interface InteractiveModeContext {
 	unfocusSession(): Promise<void>;
 	/** Clear loader, transient HUD/pending containers, streaming state, and pending tools. */
 	clearTransientSessionUi(): void;
+	/** Close terminal pane + scrollback handle before session switch (Windows file lock). */
+	closeTerminalForSessionSwitch(): void;
+	/** Create fresh scrollback persistence after new session is created. */
+	openTerminalForNewSession(): void;
 	settings: Settings;
 	keybindings: KeybindingsManager;
 	agent: AgentSession["agent"];

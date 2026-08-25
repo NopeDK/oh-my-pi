@@ -167,8 +167,7 @@ export class SelectorController {
 	 * overlay hides to re-target focus at the visible slot owner.
 	 */
 	focusActiveEditorArea(): void {
-		const visible = this.ctx.editorContainer.children[0] ?? this.ctx.editor;
-		this.ctx.ui.setFocus(visible);
+		this.ctx.ui.setFocus(this.ctx.focusTarget);
 	}
 
 	/**
@@ -179,7 +178,7 @@ export class SelectorController {
 		const done = () => {
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.setFocus(this.ctx.focusTarget);
 		};
 		const { component, focus } = create(done);
 		this.ctx.editorContainer.clear();
@@ -1872,10 +1871,12 @@ export class SelectorController {
 			return true;
 		}
 
+		this.ctx.closeTerminalForSessionSwitch();
 		const detached = await this.ctx.session.newSession();
 		if (!detached) {
 			return false;
 		}
+		this.ctx.openTerminalForNewSession();
 		this.#refreshSessionTerminalTitle();
 
 		this.ctx.clearTransientSessionUi();
@@ -1904,6 +1905,7 @@ export class SelectorController {
 		}
 		// AgentSession owns the transaction. It restores the complete source state
 		// if applying the target project's cwd fails, including in-memory sessions.
+		this.ctx.closeTerminalForSessionSwitch();
 		if (
 			(await this.ctx.session.switchSession(sessionPath, {
 				onCwdChange: async (newCwd, sourceCwd) => {
@@ -1912,8 +1914,10 @@ export class SelectorController {
 				},
 			})) === false
 		) {
+			this.ctx.openTerminalForNewSession();
 			return false;
 		}
+		this.ctx.openTerminalForNewSession();
 		this.ctx.clearTransientSessionUi();
 		const newCwd = this.ctx.sessionManager.getCwd();
 		const movedProject = normalizePathForComparison(newCwd) !== normalizePathForComparison(previousCwd);
@@ -1981,7 +1985,7 @@ export class SelectorController {
 			restored = true;
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.setFocus(this.ctx.focusTarget);
 			this.ctx.ui.requestRender();
 		};
 		const dialog = new LoginDialogComponent(this.ctx.ui, providerId, (_success, message) => {

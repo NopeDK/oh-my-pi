@@ -3992,6 +3992,20 @@ export const SETTINGS_SCHEMA = {
 		default: undefined,
 	},
 
+	// Terminal pane (AI-native shell)
+	"terminal.errorAssist": {
+		type: "enum",
+		values: ["off", "read", "prompt", "auto"] as const,
+		default: "off",
+		ui: {
+			tab: "shell",
+			group: "Terminal",
+			label: "Terminal Error Assist",
+			description:
+				"When a shell command fails (non-zero exit), feed the error context to the agent. 'off' = disabled, 'read' = agent preloads error context, 'prompt' = agent suggests a fix, 'auto' = agent runs a fix automatically.",
+		},
+	},
+
 	// Eval (per-backend toggles; add more as new backends ship, e.g. eval.ts)
 	"eval.py": {
 		type: "boolean",

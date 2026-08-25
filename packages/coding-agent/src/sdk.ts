@@ -1921,6 +1921,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// this undefined so tools and session job snapshots refuse async work
 			// instead of silently routing into the owning session (issue #1923).
 			asyncJobManager: scopedAsyncJobManager,
+			// Terminal pane bridge — delegates to AgentSession fields set by InteractiveMode.
+			getTerminalPaneState: () => session?.getTerminalPaneState?.(),
+			writeToTerminalPane: (command, pressEnter) => session?.writeToTerminalPane?.(command, pressEnter),
+			readTerminalScrollback: opts => session?.readTerminalScrollback?.(opts),
 		};
 		let browserPrelude: EvalPreludeDefinition | undefined;
 		let computerPrelude: EvalPreludeDefinition | undefined;

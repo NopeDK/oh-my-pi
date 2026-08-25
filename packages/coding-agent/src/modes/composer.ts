@@ -17,6 +17,7 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "./components/custom-editor";
+import { PaneLayout } from "./components/pane-layout";
 import { type AnimationFrame, TranscriptContainer } from "./components/transcript-container";
 import { type LspServerInfo, type RecentSession, WelcomeComponent } from "./components/welcome";
 import { getEditorTheme, initThemeSync, theme } from "./theme/theme";
@@ -257,16 +258,46 @@ export class Composer implements TerminalFrameProvider {
 			this.#resizeRetiredHeaderStart = undefined;
 		}
 		this.#lastNormalRows = rows;
-		const roots = this.#runtimeMounted
+		const roots: Component[] = this.#runtimeMounted
 			? [...this.#runtimeChildren, this.#statusHost]
 			: [this.#header, this.#bootstrapInputGap, this.editor, this.#statusHost];
-		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
-		if (transcriptIndex < 0) {
-			return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+		// Find TranscriptContainer — either directly in roots, or nested inside
+		// a PaneLayout (which wraps the agent containers as a single root).
+		let transcript: TranscriptContainer | undefined;
+		let preRoots: string[] = [];
+		let after: string[] = [];
+		const paneLayout = roots.find((root): root is PaneLayout => root instanceof PaneLayout);
+		// Only use the transcript-aware path in full-agent mode, where PaneLayout
+		// delegates entirely to the agent pane. In split/full-term modes, fall
+		// through to #renderRoots which calls PaneLayout.render() — that method
+		// handles terminal pane + separator + split layout correctly. The
+		// transcript uses unbounded Container.render in split modes (acceptable
+		// for MVP — split modes are for terminal interaction, not long transcript).
+		if (paneLayout?.transcriptContainer && paneLayout.mode === "full-agent") {
+			transcript = paneLayout.transcriptContainer;
+			const chrome = paneLayout.renderAgentChrome(width);
+			preRoots = chrome.before;
+			const paneLayoutIndex = roots.indexOf(paneLayout);
+			after = [...chrome.after, ...this.#renderRoots(roots.slice(paneLayoutIndex + 1), width)];
+		} else if (paneLayout) {
+			// Split/full-term modes: PaneLayout.render() handles terminal + agent layout.
+			// PaneLayout renders terminal.rows rows internally, but the composer also
+			// appends statusHost below. Trim PaneLayout from the top so the total
+			// (PaneLayout + statusHost) fits within the available rows.
+			const statusRows = this.#statusHost.render(width);
+			const paneRows = paneLayout.render(width);
+			const availableForPane = Math.max(0, rows - statusRows.length);
+			const trimmedPane = paneRows.length > availableForPane ? paneRows.slice(-availableForPane) : paneRows;
+			return { viewport: [...trimmedPane, ...statusRows] };
+		} else {
+			const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
+			if (transcriptIndex < 0) {
+				return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+			}
+			transcript = roots[transcriptIndex] as TranscriptContainer;
+			preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
+			after = this.#renderRoots(roots.slice(transcriptIndex + 1), width);
 		}
-		const transcript = roots[transcriptIndex] as TranscriptContainer;
-		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
-		const after = this.#renderRoots(roots.slice(transcriptIndex + 1), width);
 		// Offer history under capacity pressure only: blocks stay live (and keep
 		// reflowing to the current width) while the screen has room. A batch
 		// leaves the mutable viewport in the same frame it is appended, so its
@@ -349,17 +380,13 @@ export class Composer implements TerminalFrameProvider {
 		// stays valid and is accepted by the flush loop.
 		this.#historyReplayRequested = false;
 		this.#headerReplayPending = false;
-		for (const child of this.#runtimeChildren) {
-			if (child instanceof TranscriptContainer) child.cancelReplay();
-		}
+		this.#findRuntimeTranscript()?.cancelReplay();
 	}
 
 	#startHistoryReplay(): void {
 		this.#headerReplayPending = this.#headerRetired && (this.#retiredHeaderRows?.length ?? 0) > 0;
 		this.#historyReplayRequested = false;
-		for (const child of this.#runtimeChildren) {
-			if (child instanceof TranscriptContainer) child.beginReplay();
-		}
+		this.#findRuntimeTranscript()?.beginReplay();
 	}
 
 	/** Header retires first; replay coalesces it with the complete transcript ledger. */
@@ -467,6 +494,15 @@ export class Composer implements TerminalFrameProvider {
 		for (const root of roots) rows.push(...root.render(width));
 		return rows;
 	}
+
+	/** Find TranscriptContainer in runtime children — directly or inside a PaneLayout. */
+	#findRuntimeTranscript(): TranscriptContainer | undefined {
+		for (const child of this.#runtimeChildren) {
+			if (child instanceof TranscriptContainer) return child;
+			if (child instanceof PaneLayout) return child.transcriptContainer;
+		}
+		return undefined;
+	}
 	/**
 	 * Mounted-runtime rows for the transient resize buffer. Only the trailing
 	 * viewport can survive the caller's bottom slice, so the transcript renders
@@ -474,10 +510,24 @@ export class Composer implements TerminalFrameProvider {
 	 * it renders only when that tail underfills the screen.
 	 */
 	#renderResizeTail(width: number, rows: number): string[] {
+		const transcript = this.#findRuntimeTranscript();
+		if (!transcript) return this.#renderRoots([...this.#runtimeChildren, this.#statusHost], width);
+		// When a PaneLayout wraps the transcript, render its chrome + statusHost as "after"
+		const paneLayout = this.#runtimeChildren.find((r): r is PaneLayout => r instanceof PaneLayout);
+		if (paneLayout) {
+			// Only use transcript-aware path in full-agent mode. In split/full-term
+			// modes, PaneLayout.render() handles terminal pane + separator + layout.
+			if (paneLayout.mode !== "full-agent") {
+				return this.#renderRoots([...this.#runtimeChildren, this.#statusHost], width);
+			}
+			const chrome = paneLayout.renderAgentChrome(width);
+			const after = [...chrome.after, ...this.#statusHost.render(width)];
+			const transcriptRows = transcript.renderTail(width, Math.max(0, rows - after.length));
+			return [...chrome.before, ...transcriptRows, ...after];
+		}
+		// Direct transcript in runtime children (no PaneLayout)
 		const roots = [...this.#runtimeChildren, this.#statusHost];
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
-		if (transcriptIndex < 0) return this.#renderRoots(roots, width);
-		const transcript = roots[transcriptIndex] as TranscriptContainer;
 		const after = this.#renderRoots(roots.slice(transcriptIndex + 1), width);
 		const transcriptRows = transcript.renderTail(width, Math.max(0, rows - after.length));
 		const pre =

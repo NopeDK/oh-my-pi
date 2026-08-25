@@ -254,7 +254,7 @@ export class LiveCommandController {
 		}
 		this.#previousShowHardwareCursor = undefined;
 		this.#previousUseTerminalCursor = undefined;
-		this.#ctx.ui.setFocus(editor);
+		this.#ctx.ui.setFocus(this.#ctx.focusTarget);
 		this.#ctx.ui.requestRender();
 	}
 }

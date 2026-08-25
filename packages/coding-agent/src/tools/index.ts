@@ -21,6 +21,7 @@ import type { DaemonCompletionNotification } from "../launch/protocol";
 import { LspTool } from "../lsp";
 import type { MCPManager } from "../mcp";
 import type { MnemopiSessionState } from "../mnemopi/state";
+import type { TerminalScrollbackResult } from "../modes/components/terminal-pane";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -60,6 +61,7 @@ import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
+import type { TerminalState } from "./shell-integration-parser";
 import { supportsExternalThinking, ThinkTool } from "./think";
 import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
@@ -101,6 +103,7 @@ export * from "./report-tool-issue";
 export * from "./resolve";
 export * from "./review";
 export * from "./security-scan";
+export * from "./terminal";
 export * from "./think";
 export * from "./todo";
 export * from "./tts";
@@ -448,6 +451,22 @@ export interface ToolSession {
 	getTelemetry?: () => AgentTelemetryConfig | undefined;
 	/** Return image attachments visible to tools for resolving labels such as `Image #1`. */
 	getImageAttachments?: () => ImageAttachmentEntry[];
+
+	// ── Terminal pane bridge (AI-native shell) ────────────────────────────
+	// These are optional — non-interactive sessions don't have a terminal pane.
+	// Wired by InteractiveMode when PaneLayout is mounted.
+
+	/** Get the terminal pane state (cwd, last command, exit code, history). */
+	getTerminalPaneState?: () => Readonly<TerminalState> | undefined;
+	/** Write a command to the terminal pane's PTY. */
+	writeToTerminalPane?: (command: string, pressEnter?: boolean) => void;
+	/** Read terminal scrollback with non-duplication (default 15 lines, caps at newLinesSinceLastRead unless forced). */
+	readTerminalScrollback?: (opts: {
+		lines?: number;
+		offset?: number;
+		amount?: number;
+		force?: boolean;
+	}) => TerminalScrollbackResult | undefined;
 }
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;

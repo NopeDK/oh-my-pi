@@ -158,6 +158,7 @@ import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
+import type { TerminalScrollbackResult } from "../modes/components/terminal-pane";
 import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
 import { theme } from "../modes/theme/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
@@ -214,6 +215,7 @@ import {
 	PROPOSE_DEVICE_NAME,
 	writeDeviceDispatch,
 } from "../tools/resolve";
+import type { TerminalState } from "../tools/shell-integration-parser";
 import { supportsExternalThinking } from "../tools/think";
 import type { TodoPhase } from "../tools/todo";
 import { ToolError } from "../tools/tool-errors";
@@ -524,6 +526,15 @@ export class AgentSession {
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
 	editStore?: EditStore;
+	/** Terminal pane state bridge — set by InteractiveMode when PaneLayout is mounted. */
+	getTerminalPaneState?: () => Readonly<TerminalState> | undefined;
+	writeToTerminalPane?: (command: string, pressEnter?: boolean) => void;
+	readTerminalScrollback?: (opts: {
+		lines?: number;
+		offset?: number;
+		amount?: number;
+		force?: boolean;
+	}) => TerminalScrollbackResult | undefined;
 
 	/** Materializes this session's live extension-root policy per discovery call. */
 	readonly #extensionRoots: () => EffectiveExtensionRoots;

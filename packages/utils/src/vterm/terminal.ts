@@ -17,6 +17,10 @@ export interface TerminalOptions {
 	scrollback?: number;
 	allowProposedApi?: boolean;
 	disableStdin?: boolean;
+	/** Called after a line is promoted from screen to scrollback (scroll-off). */
+	onScrollbackCommit?: (line: BufferLine) => void;
+	/** Called when scrollback is cleared (CSI 3J or explicit flush). */
+	onScrollbackClear?: () => void;
 }
 
 /** Disposable event subscription. */
@@ -44,9 +48,8 @@ interface SavedCursor {
 
 function createState(columns: number, rows: number): BufferState {
 	return {
-		lines: Array.from({ length: rows }, () => new BufferLine(columns)),
-		baseY: 0,
-		viewportY: 0,
+		scrollback: [],
+		screen: Array.from({ length: rows }, () => new BufferLine(columns)),
 		cursorX: 0,
 		cursorY: 0,
 	};
@@ -87,11 +90,15 @@ export class Terminal {
 	#decoder = new TextDecoder();
 	#dataListeners = new Set<(data: string) => void>();
 	#disposed = false;
+	#onScrollbackCommit?: (line: BufferLine) => void;
+	#onScrollbackClear?: () => void;
 
 	constructor(options: TerminalOptions = {}) {
 		this.cols = Math.max(2, Math.floor(options.cols ?? 80));
 		this.rows = Math.max(1, Math.floor(options.rows ?? 24));
 		this.#scrollback = Math.max(0, Math.floor(options.scrollback ?? 1_000));
+		this.#onScrollbackCommit = options.onScrollbackCommit;
+		this.#onScrollbackClear = options.onScrollbackClear;
 		this.#scrollBottom = this.rows - 1;
 		this.#normal = createState(this.cols, this.rows);
 		this.#alternate = createState(this.cols, this.rows);
@@ -387,12 +394,12 @@ export class Terminal {
 
 	#appendCombining(mark: string): void {
 		let column = this.#active.cursorX - 1;
-		let row = this.#active.baseY + this.#active.cursorY;
+		let row = this.#active.cursorY;
 		if (column < 0 && row > 0) {
 			row -= 1;
 			column = this.cols - 1;
 		}
-		const line = this.#active.lines[row];
+		const line = this.#active.screen[row];
 		if (!line) return;
 		while (column >= 0 && line.cells[column]?.width === 0) column--;
 		const cell = line.cells[column];
@@ -410,27 +417,29 @@ export class Terminal {
 	}
 
 	#scrollUp(): void {
-		const top = this.#active.baseY + this.#scrollTop;
-		const bottom = this.#active.baseY + this.#scrollBottom;
 		if (this.#scrollTop === 0 && this.#scrollBottom === this.rows - 1 && !this.#usingAlternate) {
-			const followedBottom = this.#active.viewportY === this.#active.baseY;
-			this.#active.lines.push(new BufferLine(this.cols, this.#attrs));
-			const capacity = this.rows + this.#scrollback;
-			if (this.#active.lines.length > capacity) this.#active.lines.splice(0, this.#active.lines.length - capacity);
-			this.#active.baseY = Math.max(0, this.#active.lines.length - this.rows);
-			if (followedBottom) this.#active.viewportY = this.#active.baseY;
-			else this.#active.viewportY = Math.min(this.#active.viewportY, this.#active.baseY);
+			// Full-screen scroll: promote top screen line to immutable scrollback.
+			const promoted = this.#active.screen.shift()!;
+			this.#active.scrollback.push(promoted);
+			// Enforce scrollback capacity (ring buffer — evict oldest).
+			const excess = this.#active.scrollback.length - this.#scrollback;
+			if (excess > 0) this.#active.scrollback.splice(0, excess);
+			// Push new blank line at bottom of screen.
+			this.#active.screen.push(new BufferLine(this.cols, this.#attrs));
+			this.#onScrollbackCommit?.(promoted);
 			return;
 		}
-		this.#active.lines.splice(top, 1);
-		this.#active.lines.splice(bottom, 0, new BufferLine(this.cols, this.#attrs));
+		// Scroll-region scroll: operate on screen only.
+		const top = this.#scrollTop;
+		const bottom = this.#scrollBottom;
+		this.#active.screen.splice(top, 1);
+		this.#active.screen.splice(bottom, 0, new BufferLine(this.cols, this.#attrs));
 	}
-
 	#scrollDown(): void {
-		const top = this.#active.baseY + this.#scrollTop;
-		const bottom = this.#active.baseY + this.#scrollBottom;
-		this.#active.lines.splice(bottom, 1);
-		this.#active.lines.splice(top, 0, new BufferLine(this.cols, this.#attrs));
+		const top = this.#scrollTop;
+		const bottom = this.#scrollBottom;
+		this.#active.screen.splice(bottom, 1);
+		this.#active.screen.splice(top, 0, new BufferLine(this.cols, this.#attrs));
 	}
 
 	#reverseIndex(): void {
@@ -440,7 +449,7 @@ export class Terminal {
 	}
 
 	#currentLine(): BufferLine {
-		return this.#active.lines[this.#active.baseY + this.#active.cursorY]!;
+		return this.#active.screen[this.#active.cursorY]!;
 	}
 
 	#moveVertical(delta: number): void {
@@ -460,23 +469,22 @@ export class Terminal {
 
 	#eraseDisplay(mode: number): void {
 		if (mode === 3 && !this.#usingAlternate) {
-			this.#active.lines = this.#active.lines.slice(this.#active.baseY);
-			this.#active.baseY = 0;
-			this.#active.viewportY = 0;
+			// Clear scrollback history (CSI 3J).
+			this.#active.scrollback = [];
+			this.#onScrollbackClear?.();
 			return;
 		}
 		if (mode === 2) {
-			for (let row = 0; row < this.rows; row++)
-				this.#active.lines[this.#active.baseY + row] = new BufferLine(this.cols, this.#attrs);
+			for (let row = 0; row < this.rows; row++) this.#active.screen[row] = new BufferLine(this.cols, this.#attrs);
 			return;
 		}
 		if (mode === 0) {
 			this.#eraseRange(this.#currentLine(), this.#active.cursorX, this.cols);
 			for (let row = this.#active.cursorY + 1; row < this.rows; row++)
-				this.#active.lines[this.#active.baseY + row] = new BufferLine(this.cols, this.#attrs);
+				this.#active.screen[row] = new BufferLine(this.cols, this.#attrs);
 		} else if (mode === 1) {
 			for (let row = 0; row < this.#active.cursorY; row++)
-				this.#active.lines[this.#active.baseY + row] = new BufferLine(this.cols, this.#attrs);
+				this.#active.screen[row] = new BufferLine(this.cols, this.#attrs);
 			this.#eraseRange(this.#currentLine(), 0, this.#active.cursorX + 1);
 		}
 	}
@@ -496,21 +504,21 @@ export class Terminal {
 
 	#insertLines(count: number): void {
 		if (this.#active.cursorY < this.#scrollTop || this.#active.cursorY > this.#scrollBottom) return;
-		const start = this.#active.baseY + this.#active.cursorY;
-		const bottom = this.#active.baseY + this.#scrollBottom;
+		const start = this.#active.cursorY;
+		const bottom = this.#scrollBottom;
 		for (let index = 0; index < Math.min(count, bottom - start + 1); index++) {
-			this.#active.lines.splice(bottom, 1);
-			this.#active.lines.splice(start, 0, new BufferLine(this.cols, this.#attrs));
+			this.#active.screen.splice(bottom, 1);
+			this.#active.screen.splice(start, 0, new BufferLine(this.cols, this.#attrs));
 		}
 	}
 
 	#deleteLines(count: number): void {
 		if (this.#active.cursorY < this.#scrollTop || this.#active.cursorY > this.#scrollBottom) return;
-		const start = this.#active.baseY + this.#active.cursorY;
-		const bottom = this.#active.baseY + this.#scrollBottom;
+		const start = this.#active.cursorY;
+		const bottom = this.#scrollBottom;
 		for (let index = 0; index < Math.min(count, bottom - start + 1); index++) {
-			this.#active.lines.splice(start, 1);
-			this.#active.lines.splice(bottom, 0, new BufferLine(this.cols, this.#attrs));
+			this.#active.screen.splice(start, 1);
+			this.#active.screen.splice(bottom, 0, new BufferLine(this.cols, this.#attrs));
 		}
 	}
 
@@ -695,23 +703,26 @@ export class Terminal {
 		this.modes.applicationCursorKeysMode = false;
 	}
 
-	#reflow(state: BufferState, columns: number, rows: number, retainHistory: boolean): BufferState {
-		const absoluteCursor = state.baseY + state.cursorY;
+	#reflow(state: BufferState, columns: number, rows: number, _retainHistory: boolean): BufferState {
+		// Only reflow the screen lines. Scrollback is immutable — its lines
+		// stay at their original width and are never touched by resize.
+		// This prevents shell DL/IL redraws from destroying historic content.
+		const cursorRow = state.cursorY;
 		const groups: Array<{ cells: CellData[]; cursorOffset?: number }> = [];
-		for (let row = 0; row < state.lines.length; row++) {
-			const line = state.lines[row]!;
+		for (let row = 0; row < state.screen.length; row++) {
+			const line = state.screen[row]!;
 			if (!line.isWrapped || groups.length === 0) groups.push({ cells: [] });
 			const group = groups.at(-1)!;
-			const used = line.isWrapped || state.lines[row + 1]?.isWrapped ? line.cells.length : this.#usedColumns(line);
-			if (row === absoluteCursor) group.cursorOffset = group.cells.length + state.cursorX;
+			const used = line.isWrapped || state.screen[row + 1]?.isWrapped ? line.cells.length : this.#usedColumns(line);
+			if (row === cursorRow) group.cursorOffset = group.cells.length + state.cursorX;
 			for (let column = 0; column < used; column++) group.cells.push(cloneCell(line.cells[column]!));
 		}
-		const lines: BufferLine[] = [];
+		const screen: BufferLine[] = [];
 		let cursorAbsolute = 0;
 		let cursorX = 0;
 		for (const group of groups) {
-			const start = lines.length;
-			if (group.cells.length === 0) lines.push(new BufferLine(columns));
+			const start = screen.length;
+			if (group.cells.length === 0) screen.push(new BufferLine(columns));
 			else {
 				let source = 0;
 				while (source < group.cells.length) {
@@ -730,7 +741,7 @@ export class Terminal {
 						target += cell.width;
 						source += cell.width;
 					}
-					lines.push(line);
+					screen.push(line);
 				}
 			}
 			if (group.cursorOffset !== undefined) {
@@ -740,27 +751,70 @@ export class Terminal {
 				cursorX = onBoundary ? columns - 1 : offset % columns;
 			}
 		}
-		while (
-			lines.length > rows &&
-			cursorAbsolute < lines.length - 1 &&
-			!lines.at(-1)!.isWrapped &&
-			this.#usedColumns(lines.at(-1)!) === 0
-		) {
-			lines.pop();
+		// Handle row count change. On shrink, discard excess screen lines —
+		// ConPTY will repaint the screen content after the PTY resize, so
+		// promoting to scrollback would create duplicates (the same content
+		// reappears in both scrollback and the repainted screen).
+		if (screen.length > rows) {
+			const excess = screen.length - rows;
+			screen.splice(0, excess);
+			cursorAbsolute = Math.max(0, cursorAbsolute - excess);
 		}
-		while (lines.length < rows) lines.push(new BufferLine(columns));
-		const capacity = rows + (retainHistory ? this.#scrollback : 0);
-		const removed = Math.max(0, lines.length - capacity);
-		if (removed > 0) lines.splice(0, removed);
-		cursorAbsolute = Math.max(0, cursorAbsolute - removed);
-		const baseY = Math.max(0, lines.length - rows);
+		while (screen.length < rows) screen.push(new BufferLine(columns));
 		return {
-			lines,
-			baseY,
-			viewportY: baseY,
+			scrollback: state.scrollback,
+			screen,
 			cursorX,
-			cursorY: Math.min(rows - 1, Math.max(0, cursorAbsolute - baseY)),
+			cursorY: Math.min(rows - 1, Math.max(0, cursorAbsolute)),
 		};
+	}
+
+	/**
+	 * Promotes all non-blank screen lines to scrollback, then refills the
+	 * screen with blank lines. Called before saving scrollback to the
+	 * sidecar so the last command's output is captured. Only operates on
+	 * the normal buffer (not alternate).
+	 */
+	flushScreenToScrollback(): void {
+		if (this.#usingAlternate) return;
+		const screen = this.#normal.screen;
+		// Find last non-blank row
+		let lastContent = -1;
+		for (let row = screen.length - 1; row >= 0; row--) {
+			if (this.#usedColumns(screen[row]!) > 0) {
+				lastContent = row;
+				break;
+			}
+		}
+		// Promote each content line to scrollback
+		for (let row = 0; row <= lastContent; row++) {
+			const promoted = screen[row]!;
+			this.#normal.scrollback.push(promoted);
+			const excess = this.#normal.scrollback.length - this.#scrollback;
+			if (excess > 0) this.#normal.scrollback.splice(0, excess);
+			this.#onScrollbackCommit?.(promoted);
+		}
+		// Refill screen with blank lines
+		this.#normal.screen = Array.from({ length: this.rows }, () => new BufferLine(this.cols, this.#attrs));
+		this.#normal.cursorX = 0;
+		this.#normal.cursorY = 0;
+	}
+
+	/**
+	 * Injects previously-saved scrollback lines into the normal buffer.
+	 * Called after a fresh shell starts on session resume. Restored lines
+	 * appear above the new prompt as frozen history.
+	 */
+	restoreScrollback(lines: BufferLine[]): void {
+		if (this.#usingAlternate) return;
+		// Prepend restored lines, respecting scrollback cap
+		const cap = this.#scrollback;
+		const available = Math.max(0, cap - this.#normal.scrollback.length);
+		const toAdd = available === 0 ? [] : lines.slice(-available);
+		this.#normal.scrollback = [...toAdd, ...this.#normal.scrollback];
+		// Enforce cap
+		const excess = this.#normal.scrollback.length - cap;
+		if (excess > 0) this.#normal.scrollback.splice(0, excess);
 	}
 
 	#usedColumns(line: BufferLine): number {

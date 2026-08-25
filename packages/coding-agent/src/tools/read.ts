@@ -618,12 +618,14 @@ const MAX_IMAGE_SIZE = MAX_IMAGE_INPUT_BYTES;
 
 const readSchema = type({
 	path: type("string").describe(
-		"Local path, internal URI (e.g. memory://, skill://), or URL. Inline selectors are supported.",
+		"Local path, internal URI (e.g. memory://, skill://, terminal://), or URL. Inline selectors are supported. Use terminal:// to read the persistent terminal pane's scrollback.",
 	),
 });
 
 const readSchemaWithoutMemory = type({
-	path: type("string").describe("Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."),
+	path: type("string").describe(
+		"Local path, internal URI (e.g. skill://, terminal://), or URL. Inline selectors are supported. Use terminal:// to read the persistent terminal pane's scrollback.",
+	),
 });
 
 export type ReadToolInput = typeof readSchema.infer;
@@ -1289,6 +1291,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				);
 			}
 			readPath = attachment.sourcePath;
+		}
+
+		// terminal:// — read the persistent terminal pane's scrollback.
+		// Maps to session.readTerminalScrollback() so the agent can use the
+		// familiar read tool instead of the read_terminal tool directly.
+		// Supports :N-M selector for line ranges (mapped to offset/amount).
+		if (readPath.startsWith("terminal://")) {
+			return this.#readTerminalScrollback(readPath);
 		}
 
 		const conflictUri = parseConflictUri(readPath);
@@ -2131,6 +2141,98 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			displayContent: { text: rawText, startLine: region.startLine },
 		};
 		return toolResult<ReadToolDetails>(details).text(formattedText).sourcePath(entry.absolutePath).done();
+	}
+
+	/**
+	 * Read the persistent terminal pane's scrollback via `terminal://` URL.
+	 * Maps the read tool's selector syntax to the terminal scrollback API:
+	 * - `terminal://` — default: last 15 lines (non-duplicated)
+	 * - `terminal://:0-30` — 30 lines from the bottom (offset 0, amount 30)
+	 * - `terminal://:10-40` — 30 lines starting 10 from the bottom
+	 * - `terminal://?force` — re-read regardless of duplication
+	 * This lets the agent use the familiar `read` tool instead of the
+	 * `read_terminal` tool, avoiding the MCP device confusion.
+	 */
+	async #readTerminalScrollback(readPath: string): Promise<AgentToolResult<ReadToolDetails>> {
+		if (!this.session.readTerminalScrollback) {
+			throw new ToolError(
+				"No terminal pane available. Start a terminal pane with Shift+Alt+S or Shift+Alt+D first.",
+			);
+		}
+		// Parse selector from terminal://path:selector
+		// Supports: :N-M (inclusive range, yields M-N+1 lines), :N (amount), :force, :force:N-M, :force:N, :raw
+		const selMatch = readPath.match(/^terminal:\/\/[^:]*:(.+)$/);
+		let offset = 0;
+		let amount = 15;
+		let force = false;
+		if (selMatch) {
+			const sel = selMatch[1];
+			// Strip optional force/raw prefix, leaving the rest for range parsing
+			let rest = sel;
+			if (sel.startsWith("force:") || sel.startsWith("raw:")) {
+				force = true;
+				rest = sel.slice(sel.indexOf(":") + 1);
+			} else if (sel === "force" || sel === "raw") {
+				force = true;
+				rest = "";
+			}
+			if (rest) {
+				// Parse N-M range → offset=N, amount=M-N+1 (inclusive)
+				const rangeMatch = rest.match(/^(\d+)-(\d+)$/);
+				if (rangeMatch) {
+					offset = Number.parseInt(rangeMatch[1], 10);
+					amount = Number.parseInt(rangeMatch[2], 10) - offset + 1;
+				} else if (/^\d+$/.test(rest)) {
+					// :N → amount=N
+					amount = Number.parseInt(rest, 10);
+				}
+			} else if (force) {
+				// :force alone → return all available content
+				amount = 10000;
+			}
+		}
+		const requestedAmount = amount;
+		const result = this.session.readTerminalScrollback({ offset, amount, force });
+		if (!result) {
+			throw new ToolError(
+				"No terminal pane available. Start a terminal pane with Shift+Alt+S or Shift+Alt+D first.",
+			);
+		}
+		const lines = result.lines;
+		// Build feedback notes for the LLM when fewer lines are returned than expected
+		const notes: string[] = [];
+		if (!force && result.newLinesSinceLastRead < requestedAmount && lines.length < requestedAmount) {
+			notes.push(
+				`Non-duplication: only ${result.newLinesSinceLastRead} new line(s) since last read (requested ${requestedAmount}). Use terminal://:force or terminal://:force:${offset}-${offset + requestedAmount - 1} to re-read regardless.`,
+			);
+		}
+		if (lines.length < amount && lines.length < result.totalLines) {
+			notes.push(
+				`Buffer clamp: only ${lines.length} line(s) available in the requested range (buffer has ${result.totalLines} total content lines).`,
+			);
+		}
+		if (lines.length === 0 && !force) {
+			notes.push("No new lines since last read. Use terminal://:force to re-read existing content.");
+		}
+		const header = [
+			`CWD: ${result.cwd ?? "(unknown)"}`,
+			`Last command: ${result.lastCommand ?? "(none)"}${result.lastExitCode !== undefined ? ` (exit code: ${result.lastExitCode})` : ""}`,
+			`New lines since last read: ${result.newLinesSinceLastRead}`,
+			`Total content lines: ${result.totalLines}`,
+			`Read position: ${result.readPosition} (lines from bottom already read)`,
+			...(notes.length > 0 ? ["", ...notes] : []),
+			"",
+			`--- Terminal output (${lines.length} lines) ---`,
+		].join("\n");
+		const text =
+			lines.length > 0
+				? `${header}\n${lines.join("\n")}`
+				: `${header}\n(no lines returned${notes.length > 0 ? ` — ${notes[notes.length - 1]}` : " — use terminal://:force to re-read"})`;
+		const details: ReadToolDetails = {
+			resolvedPath: "terminal://",
+			contentType: "text/plain",
+		};
+		return toolResult<ReadToolDetails>(details).text(text).sourcePath("terminal://").done();
 	}
 
 	/**

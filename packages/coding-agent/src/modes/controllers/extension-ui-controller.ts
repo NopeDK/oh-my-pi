@@ -230,10 +230,12 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
+				this.ctx.closeTerminalForSessionSwitch();
 				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
 				if (!success) {
 					return { cancelled: true };
 				}
+				this.ctx.openTerminalForNewSession();
 				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 				// Call setup callback if provided
@@ -463,11 +465,12 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
+				this.ctx.closeTerminalForSessionSwitch();
 				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
 				if (!success) {
 					return { cancelled: true };
 				}
-
+				this.ctx.openTerminalForNewSession();
 				// Call setup callback if provided
 				if (options?.setup) {
 					await options.setup(this.ctx.sessionManager);
@@ -727,7 +730,7 @@ export class ExtensionUiController {
 				promptEditor = undefined;
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(this.ctx.editor);
-				this.ctx.ui.setFocus(this.ctx.editor);
+				this.ctx.ui.setFocus(this.ctx.focusTarget);
 				this.ctx.ui.requestRender();
 			};
 		});
@@ -955,7 +958,7 @@ export class ExtensionUiController {
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.hookSelector = undefined;
-		this.ctx.ui.setFocus(this.ctx.editor);
+		this.ctx.ui.setFocus(this.ctx.focusTarget);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1003,7 +1006,7 @@ export class ExtensionUiController {
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.hookInput = undefined;
-		this.ctx.ui.setFocus(this.ctx.editor);
+		this.ctx.ui.setFocus(this.ctx.focusTarget);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1041,7 +1044,7 @@ export class ExtensionUiController {
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.hookEditor = undefined;
-		this.ctx.ui.setFocus(this.ctx.editor);
+		this.ctx.ui.setFocus(this.ctx.focusTarget);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1088,7 +1091,7 @@ export class ExtensionUiController {
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.editor.setText(savedText);
 			}
-			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.setFocus(this.ctx.focusTarget);
 			this.ctx.ui.requestRender();
 		};
 		const finish = (settle: () => void) => {

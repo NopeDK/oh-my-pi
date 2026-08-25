@@ -1841,28 +1841,40 @@ export class SessionManager {
 	async #dropIfEmptyAndNoDraft(): Promise<void> {
 		if (!this.#draftOnlySessionCleanupArmed) return;
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile || !this.#storage.existsSync(sessionFile)) {
+		if (!sessionFile) {
 			this.#draftOnlySessionCleanupArmed = false;
 			return;
 		}
-		const draftPath = this.#draftPath();
-		if (draftPath && this.#storage.existsSync(draftPath)) return;
-		if (!this.#entries.every(isDraftOnlyMetadataEntry)) {
-			await this.#clearDraftOnlySessionMarker();
-			this.#draftOnlySessionCleanupArmed = false;
-			return;
-		}
-		try {
-			await this.#storage.deleteSessionWithArtifacts(sessionFile);
-			this.#fileIsCurrent = false;
-			this.#forceFileCreation = false;
-			this.#hasTitleSlot = false;
-			this.#draftOnlySessionCleanupArmed = false;
-		} catch (err) {
-			if (!isEnoent(err)) {
-				logger.warn("Failed to drop empty session on close", { sessionFile, error: String(err) });
+		// JSONL exists — normal cleanup path.
+		if (this.#storage.existsSync(sessionFile)) {
+			const draftPath = this.#draftPath();
+			if (draftPath && this.#storage.existsSync(draftPath)) return;
+			if (!this.#entries.every(isDraftOnlyMetadataEntry)) {
+				await this.#clearDraftOnlySessionMarker();
+				this.#draftOnlySessionCleanupArmed = false;
+				return;
+			}
+			try {
+				await this.#storage.deleteSessionWithArtifacts(sessionFile);
+			} catch (err) {
+				if (!isEnoent(err)) {
+					logger.warn("Failed to drop empty session on close", { sessionFile, error: String(err) });
+				}
+			}
+		} else {
+			// JSONL was never written (no agent messages) — but artifacts dir
+			// may exist (e.g. terminal scrollback sidecar). Clean it up.
+			const artifactsDir = sessionFile.slice(0, -JSONL_SUFFIX_LENGTH);
+			try {
+				fs.rmSync(artifactsDir, { recursive: true, force: true });
+			} catch {
+				// Best-effort — dir may not exist.
 			}
 		}
+		this.#fileIsCurrent = false;
+		this.#forceFileCreation = false;
+		this.#hasTitleSlot = false;
+		this.#draftOnlySessionCleanupArmed = false;
 	}
 
 	/** Flush, then close the append writer. */
@@ -1875,6 +1887,17 @@ export class SessionManager {
 				this.#fileIsCurrent = true;
 		});
 		await this.#dropIfEmptyAndNoDraft();
+		// Clean up artifacts dir for sessions that were never written to disk
+		// (no JSONL) — e.g. opened terminal, ran commands, but sent no agent
+		// messages before exiting. The scrollback sidecar would otherwise orphan.
+		if (this.#sessionFile && !this.#storage.existsSync(this.#sessionFile)) {
+			const artifactsDir = this.#sessionFile.slice(0, -JSONL_SUFFIX_LENGTH);
+			try {
+				fs.rmSync(artifactsDir, { recursive: true, force: true });
+			} catch {
+				// Best-effort — dir may not exist.
+			}
+		}
 		// Wait for any queued backing writes (IndexedSessionStorage per-path
 		// tail) to become durable so a graceful shutdown does not exit while
 		// a fire-and-forget publish is still on the wire.

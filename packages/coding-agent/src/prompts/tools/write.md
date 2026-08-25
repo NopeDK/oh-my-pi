@@ -7,6 +7,8 @@ Creates or overwrites file at specified path.
 - Supports SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON content, delete with empty content)
 </conditions>
 
+Supports `terminal://` path to send commands to the persistent terminal pane's shell PTY. Default presses Enter; use `terminal://:type` to type without executing. Use `read("terminal://")` to see the output.
+
 <critical>
 - You SHOULD use Edit tool for modifying existing files
 - You NEVER create documentation files (*.md, README) unless explicitly requested

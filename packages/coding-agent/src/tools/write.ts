@@ -555,6 +555,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return "exec";
 			}
 		}
+		// terminal:// writes send commands to the shell PTY — exec tier with
+		// its own policyKey so users can scope allow/deny/prompt to terminal
+		// writes independently from filesystem writes.
+		if (path.startsWith("terminal://")) return { tier: "exec", policyKey: "terminal" };
 		// Remote SSH writes open an outbound connection and run a remote shell —
 		// gate them like the exec-tier `ssh` tool, ahead of the handler-write
 		// logic. Substring match also covers selector-suffixed targets.
@@ -1120,7 +1124,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// session-local sandbox.
 		// Peel a read-tool selector (`:raw`, `:1-20`, …) so the write target matches
 		// what `read` resolves for the same URL; line-range/malformed selectors throw.
-		const path = peelWriteUrlSelector(unwrapHashlineHeaderPath(rawPath));
+		// terminal:// — send content to the persistent terminal pane's PTY.
+		// Maps to session.writeToTerminalPane() so the agent can use the
+		// familiar write tool instead of the send_terminal tool directly.
+		// Supports :type selector to send without pressing Enter.
+		const unwrappedPath = unwrapHashlineHeaderPath(rawPath);
+		if (unwrappedPath.startsWith("terminal://")) {
+			return untilAborted(signal, () => this.#writeTerminal(unwrappedPath, content));
+		}
+		const path = peelWriteUrlSelector(unwrappedPath);
 		// A device-only session grants `write` purely as the xd:// transport (see
 		// createTools): device dispatches proceed, every other target is rejected
 		// before any handler, guard, conflict resolver, or bridge sees it. Active
@@ -1362,6 +1374,38 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						.get(),
 				},
 			};
+		});
+	}
+
+	/**
+	 * Send content to the persistent terminal pane's PTY via write("terminal://").
+	 * Supports :type selector to send without pressing Enter.
+	 */
+	#writeTerminal(writePath: string, content: string): Promise<AgentToolResult<WriteToolDetails>> {
+		if (!this.session.writeToTerminalPane) {
+			return Promise.resolve({
+				content: [
+					{
+						type: "text",
+						text: "No terminal pane is mounted. The terminal pane is created when the user opens the shell pane (Shift+Alt+S or Shift+Alt+D).",
+					},
+				],
+				details: { resolvedPath: "terminal://", contentType: "text/plain" },
+			});
+		}
+		// Parse selector: :type sends without Enter, default presses Enter
+		const selector = writePath.slice("terminal://".length);
+		const pressEnter = !/^(?::type)$/i.test(selector);
+		this.session.writeToTerminalPane(content, pressEnter);
+		const action = pressEnter ? "sent (Enter pressed)" : "typed (no Enter)";
+		return Promise.resolve({
+			content: [
+				{
+					type: "text",
+					text: `Command ${action}: ${content}`,
+				},
+			],
+			details: { resolvedPath: "terminal://", contentType: "text/plain" },
 		});
 	}
 }

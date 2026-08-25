@@ -2,6 +2,8 @@
  * Interactive mode for the coding agent.
  * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
  */
+
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -111,6 +113,7 @@ import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
+import { ScrollbackPersistence } from "../session/scrollback-persistence";
 import type { SessionContext } from "../session/session-context";
 import { getRecentSessions } from "../session/session-listing";
 import type { SessionManager } from "../session/session-manager";
@@ -129,6 +132,7 @@ import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { formatMoreItems, replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
+import type { CommandBoundary } from "../tools/shell-integration-parser";
 import {
 	formatPhaseDisplayName,
 	isClosedTodo,
@@ -173,10 +177,12 @@ import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
+import { PaneLayout } from "./components/pane-layout";
 import { type PlanReviewAnnotationState, PlanReviewOverlay } from "./components/plan-review-overlay";
 import { PlanSaveOverlay, type PlanSaveOverlayResult } from "./components/plan-save-overlay";
 import { SessionInfoOverlay } from "./components/session-info-overlay";
 import { StatusLineComponent } from "./components/status-line";
+import type { ShellExitInfo } from "./components/terminal-pane";
 import { stopSharedSpinnerTicker, type ToolExecutionHandle } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
 import type { LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
@@ -587,6 +593,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
+	/** Split/toggle layout manager wrapping agent containers + terminal pane. */
+	#paneLayout: PaneLayout | undefined;
+	#scrollbackPersistence: ScrollbackPersistence | undefined;
+	/** Component that should receive focus after dialogs close — PaneLayout if
+	 *  active (it delegates to the editor internally), else the editor itself. */
+	get focusTarget(): Component {
+		return this.#paneLayout ?? this.editor;
+	}
 
 	isInitialized = false;
 	initialChatRendered = false;
@@ -1203,7 +1217,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		});
 		this.composer.setStatusComponent(this.statusLine);
 
-		this.composer.setRuntimeChildren([
+		// Wrap agent containers in a single Container, then mount PaneLayout
+		// as the sole runtime child. PaneLayout manages split/toggle layout:
+		// full-agent (default), split-v, split-h, full-term. The terminal pane
+		// is lazily created on first Shift+Alt+S/D keybind press.
+		const agentPaneContainer = new Container();
+		for (const child of [
 			this.chatContainer,
 			this.pendingMessagesContainer,
 			this.todoContainer,
@@ -1223,8 +1242,49 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.hookWidgetContainerAbove,
 			this.editorContainer,
 			this.hookWidgetContainerBelow,
-		]);
-		this.ui.setFocus(this.editor);
+		]) {
+			agentPaneContainer.addChild(child);
+		}
+		// Create scrollback persistence sidecar if session has an artifacts dir.
+		// On resume, open() reads the existing sidecar. On fresh sessions, the
+		// file is created lazily on first commit() to avoid orphaned sidecar files.
+		const artifactsDir = this.sessionManager.getArtifactsDir();
+		if (artifactsDir) {
+			this.#scrollbackPersistence = new ScrollbackPersistence(artifactsDir, this.ui.terminal.columns);
+			const sidecarExists = fsSync.existsSync(path.join(artifactsDir, "terminal-scrollback.bin"));
+			if (sidecarExists) {
+				this.#scrollbackPersistence.open();
+				if (this.#scrollbackPersistence.totalLines === 0) {
+					const hasScrollbackEntry = this.sessionManager
+						.getEntries()
+						.some(e => e.type === "custom" && e.customType === "terminal_scrollback");
+					if (!hasScrollbackEntry) {
+						this.sessionManager.appendCustomEntry("terminal_scrollback", {
+							file: this.#scrollbackPersistence.filePath,
+							cols: this.ui.terminal.columns,
+						});
+					}
+				}
+			}
+		}
+		this.#paneLayout = new PaneLayout(agentPaneContainer, {
+			theme,
+			getTerminalRows: () => this.ui.terminal.rows,
+			cwd: this.sessionManager.getCwd(),
+			onCommandFailed: (boundary, scrollback) => this.#handleTerminalCommandFailed(boundary, scrollback),
+			onTerminalStateChange: () => this.ui.requestRender(),
+			agentInputTarget: this.editor,
+			scrollbackPersistence: this.#scrollbackPersistence,
+			onShellExit: info => this.#handleShellExit(info),
+		});
+		this.composer.setRuntimeChildren([this.#paneLayout]);
+		// Wire terminal pane bridge on AgentSession so read_terminal/send_terminal
+		// tools can access the terminal pane through the ToolSession.
+		this.session.getTerminalPaneState = () => this.#paneLayout?.getTerminalState();
+		this.session.writeToTerminalPane = (command, pressEnter) =>
+			this.#paneLayout?.writeToTerminalPane(command, pressEnter);
+		this.session.readTerminalScrollback = opts => this.#paneLayout?.readTerminalScrollback(opts);
+		this.ui.setFocus(this.#paneLayout);
 		this.syncComposerShape();
 
 		this.#inputController.setupKeyHandlers();
@@ -4915,6 +4975,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		// terminal back (which would leave the parent shell with a `π ⠋ …` tab).
 		disposeTerminalTitleState();
 		popTerminalTitle();
+		// Kill the terminal pane's PTY before stopping the UI — otherwise the
+		// shell process (pwsh/powershell/cmd) is orphaned when process.exit runs.
+		this.#paneLayout?.dispose();
 		this.stop();
 	}
 
@@ -5659,6 +5722,102 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handlePythonCommand(code, excludeFromContext);
 	}
 
+	/**
+	 * ErrorAssist: when a shell command in the terminal pane fails (non-zero
+	 * exit code), feed the error context to the agent based on the
+	 * `terminal.errorAssist` setting:
+	 * - off: no action
+	 * - read: steer error context as background info
+	 * - prompt: steer a suggestion for the agent to help fix the error
+	 * - auto: steer a directive for the agent to run a fix
+	 *
+	 * cmd.exe emits 133;D without exit code — ErrorAssist cannot trigger
+	 * because exitCode is undefined. The ShellIntegrationParser only calls
+	 * onCommandFailed when exitCode is a non-zero number.
+	 */
+	#handleTerminalCommandFailed(boundary: CommandBoundary, scrollback: string[]): void {
+		const mode = this.settings.get("terminal.errorAssist");
+		if (mode === "off" || mode === undefined) return;
+		// Error context is capped at the command boundary (133;C to 133;D rows)
+		const errorOutput = scrollback.join("\n").trim();
+		if (!errorOutput) return;
+		const command = boundary.command || "(unknown command)";
+		const exitCode = boundary.exitCode ?? 0;
+		const context = [
+			`Terminal command failed:`,
+			`Command: ${command}`,
+			`Exit code: ${exitCode}`,
+			`Output:`,
+			errorOutput,
+		].join("\n");
+		const steerMessage = (text: string) =>
+			this.session.agent.steer({
+				role: "user",
+				content: text,
+				steering: true,
+				timestamp: Date.now(),
+			});
+		if (mode === "read") {
+			steerMessage(
+				`[Terminal ErrorAssist] A command in the terminal pane failed. Context provided for awareness:\n\n${context}`,
+			);
+		} else if (mode === "prompt") {
+			steerMessage(
+				`[Terminal ErrorAssist] A command in the terminal pane failed. Consider suggesting a fix:\n\n${context}`,
+			);
+		} else if (mode === "auto") {
+			steerMessage(
+				`[Terminal ErrorAssist] A command in the terminal pane failed. Investigate and run a fix using read("terminal://") and write("terminal://"):\n\n${context}`,
+			);
+		}
+	}
+
+	/**
+	 * Handle shell process exit. PaneLayout already flushed screen to
+	 * scrollback and called flushSync() before invoking this callback.
+	 *
+	 * Exit classification:
+	 * - cancelled (host killed) or timedOut: keep sidecar for resume.
+	 * - exitCode=0, not cancelled, not timed out: deliberate exit (user
+	 *   typed `exit`). Delete sidecar — user wants a fresh shell on resume.
+	 *   The 133;D mark is NOT checked because `exit` terminates the shell
+	 *   before the prompt handler can emit it — lastMark is "B" or "C".
+	 * - exitCode!=0: crash or error. Keep sidecar.
+	 * - Unknown (cmd.exe, no marks): exitCode=0 → deliberate.
+	 */
+	#handleShellExit(info: ShellExitInfo): void {
+		if (!this.#scrollbackPersistence) return;
+		const deliberate = info.exitCode === 0 && !info.cancelled && !info.timedOut;
+		if (deliberate) {
+			this.#scrollbackPersistence.delete();
+			this.#scrollbackPersistence = undefined;
+		}
+	}
+
+	/**
+	 * Close terminal pane and scrollback persistence BEFORE session switch.
+	 * The file handle must be released before dropSession can delete the
+	 * artifacts directory (Windows can't delete dirs with open file handles).
+	 */
+	closeTerminalForSessionSwitch(): void {
+		this.#paneLayout?.resetTerminal();
+		this.#scrollbackPersistence?.close();
+		this.#scrollbackPersistence = undefined;
+	}
+
+	/**
+	 * Create a fresh ScrollbackPersistence for the new session after
+	 * newSession() has switched to a new artifacts directory.
+	 */
+	openTerminalForNewSession(): void {
+		const artifactsDir = this.sessionManager.getArtifactsDir();
+		if (artifactsDir) {
+			// Don't open() eagerly — the file is created lazily on first
+			// commit() so empty sessions don't leave orphaned sidecar files.
+			this.#scrollbackPersistence = new ScrollbackPersistence(artifactsDir, this.ui.terminal.columns);
+			this.#paneLayout?.updateScrollbackPersistence(this.#scrollbackPersistence);
+		}
+	}
 	async handleMCPCommand(text: string): Promise<void> {
 		const controller = new MCPCommandController(this);
 		await controller.handle(text);
